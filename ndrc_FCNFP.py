@@ -1,61 +1,13 @@
+import sys
 import cplex
 import numpy as np
 import time
-import sys
+from reader import read_instance
 from itertools import chain, combinations
-
-# LEITOR DE INSTÂNCIAS
-
-def read_instance(filename):
-    params = {}
-    node_balances = {}
-    arcs_data = []
-
-    try:
-        with open(filename, 'r') as f:
-            section = None
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith('#'):
-                    continue
-
-                if line == "NODE_BALANCES":
-                    section = "nodes"
-                    continue
-                elif line == "ARCS":
-                    section = "arcs"
-                    continue
-                elif line == "END_NODE_BALANCES" or line == "END_ARCS":
-                    section = None
-                    continue
-
-                if section == "nodes":
-                    parts = line.split()
-                    node_id = int(parts[0])
-                    b_i = int(parts[1])
-                    node_balances[node_id] = b_i
-                elif section == "arcs":
-                    parts = line.split()
-                    i = int(parts[0])
-                    j = int(parts[1])
-                    c_ij = int(parts[2])
-                    f_ij = int(parts[3])
-                    w_ij = int(parts[4])
-                    arcs_data.append((i, j, c_ij, f_ij, w_ij))
-                elif section is None and ':' in line:
-                    key, value = line.split(':', 1)
-                    params[key.strip()] = int(value.strip())
-
-    except FileNotFoundError:
-        print(f"Erro: File '{filename}' not found.")
-        sys.exit(1)
-        
-    return params, node_balances, arcs_data
 
 # HEURÍSTICA PRIMAL
 
-def initial_heuristic(num_nodes, b_list, arcs_data):
-    print("  Calculando UB inicial (Heurística MCF).")
+def initial_heuristic(num_nodes, b_list, arcs_data): # MFC
     try:
         model = cplex.Cplex()
         model.set_log_stream(None)
@@ -63,7 +15,7 @@ def initial_heuristic(num_nodes, b_list, arcs_data):
         model.objective.set_sense(model.objective.sense.minimize)
 
         x_names = [f"x_{i}_{j}" for (i, j, c, f, w) in arcs_data]
-        x_costs = [c for (i, j, c, f, w) in arcs_data]
+        x_costs = [c + (f / w) if w > 0 else c for (i, j, c, f, w) in arcs_data]
         x_caps = [w for (i, j, c, f, w) in arcs_data]
         model.variables.add(obj=x_costs, ub=x_caps, names=x_names)
 
@@ -83,13 +35,15 @@ def initial_heuristic(num_nodes, b_list, arcs_data):
         model.solve()
 
         if model.solution.get_status() == model.solution.status.optimal:
-            solution_x = model.solution.get_values()
-            variable_cost = model.solution.get_objective_value()
-            fixed_cost = 0.0
+            sol_x = model.solution.get_values()
+            total_cost = 0.0
             for k, (i, j, c, f, w) in enumerate(arcs_data):
-                if solution_x[k] > 1e-6:
-                    fixed_cost += f
-            return variable_cost + fixed_cost
+                flow_val = sol_x[k]
+                total_cost += flow_val * c
+                if flow_val > 1e-6:
+                    total_cost += f
+            
+            return total_cost
         else:
             return float('inf')
     except cplex.exceptions.CplexError as e:
@@ -97,58 +51,64 @@ def initial_heuristic(num_nodes, b_list, arcs_data):
     
 # HEURÍSTICA LAGRANGEANA
         
-def lagrangean_heuristic(num_nodes, b_list, arcs_data, y_bar):
-    open_arcs = []
-    open_arcs_names = []
-    
-    for (i, j, c, f, w) in arcs_data:
-         if y_bar.get(f"y_{i}_{j}", 0) > 0.5:
-            open_arcs.append((i, j, c, f, w))
-            open_arcs_names.append(f"x_{i}_{j}")
-    
-    if not open_arcs:
-        if all(b == 0 for b in b_list): return 0.0
-        return float('inf')
-
+def lagrangean_heuristic(num_nodes, b_list, arcs_data, y_bar, penalty_factor=1.0): # Slope Scaling
     try:
         model = cplex.Cplex()
         model.set_log_stream(None)
         model.set_results_stream(None)
         model.objective.set_sense(model.objective.sense.minimize)
 
-        x_costs = [c for (i, j, c, f, w) in open_arcs]
-        x_caps = [w for (i, j, c, f, w) in open_arcs]
-        model.variables.add(obj=x_costs, ub=x_caps, names=open_arcs_names)
+        x_names = [f"x_{i}_{j}" for (i, j, c, f, w) in arcs_data]
+        x_caps = [w for (i, j, c, f, w) in arcs_data]
 
+        guided_costs = []
+        for (i, j, c, f, w) in arcs_data:
+            val_y = y_bar.get(f"y_{i}_{j}", 0.0)
+            
+            if val_y > 0.5:
+                guided_costs.append(c)
+            else:
+                # penalidade multiplicada pelo fator penalty_factor
+                base_penalty = c + (f / w) if w > 1e-6 else c
+                guided_costs.append(base_penalty * penalty_factor)
+
+        model.variables.add(obj=guided_costs, ub=x_caps, names=x_names)
+
+        # restrições de fluxo
         constraints = []
         for node_id in range(num_nodes):
             flow_balance = cplex.SparsePair()
-            for k, (i, j, c, f, w) in enumerate(open_arcs):
+            for k, (i, j, c, f, w) in enumerate(arcs_data):
                 if i == node_id:
-                    flow_balance.ind.append(open_arcs_names[k])
-                    flow_balance.val.append(1.0)
+                    flow_balance.ind.append(x_names[k]); flow_balance.val.append(1.0)
                 if j == node_id:
-                    flow_balance.ind.append(open_arcs_names[k])
-                    flow_balance.val.append(-1.0)
+                    flow_balance.ind.append(x_names[k]); flow_balance.val.append(-1.0)
             constraints.append(flow_balance)
         model.linear_constraints.add(lin_expr=constraints, senses=['E'] * num_nodes, rhs=b_list)
 
         model.solve()
 
         if model.solution.get_status() == model.solution.status.optimal:
-            variable_cost = model.solution.get_objective_value()
-            fixed_cost = sum(f for (i, j, c, f, w) in open_arcs)
-            return variable_cost + fixed_cost
+            sol_x = model.solution.get_values()
+            
+            # calcula os custos reais
+            real_total_cost = 0.0
+            for k, (i, j, c, f, w) in enumerate(arcs_data):
+                flow_val = sol_x[k]
+                real_total_cost += flow_val * c
+                if flow_val > 1e-6:
+                    real_total_cost += f
+            return real_total_cost
         else:
             return float('inf')
-    except cplex.exceptions.CplexError as e:
+
+    except cplex.exceptions.CplexError:
         return float('inf')
 
 # SUBPROBLEMA LAGRANGEANO
 
 def lagrangian_subproblem(num_nodes, arcs_data, b_list, 
                                 lambda_multipliers, active_cuts_pool):
-
     try:
         model = cplex.Cplex()
         model.set_log_stream(None)
@@ -168,32 +128,24 @@ def lagrangian_subproblem(num_nodes, arcs_data, b_list,
 
         for k, (i, j, c, f, w) in enumerate(arcs_data):
             lam = lambda_multipliers[k]
-            obj_costs_x.append(c + lam)            # custo c_ij + lambda_ij para x_ij
-            obj_costs_y.append(f - lam * w)        # custo f_ij - lambda_ij * w_ij para y_ij
+            obj_costs_x.append(c + lam) # custo c_ij + lambda_ij para x_ij
+            obj_costs_y.append(f - lam * w) # custo f_ij - lambda_ij * w_ij para y_ij
 
         # ajuste dos custos com mu_k (cortes de conectividade)
+        const_mu = 0.0
+
         for (cut_id, mu_k, cut_S, cut_RHS) in active_cuts_pool:
             if mu_k > 1e-9:
+                const_mu += mu_k * cut_RHS
                 for k, (i, j, c, f, w) in enumerate(arcs_data):
-                    if (i in cut_S) and (j not in cut_S):
+                    if (i not in cut_S) and (j in cut_S):
                         obj_costs_y[k] -= mu_k * w
 
         # variáveis
-        model.variables.add(
-            obj=obj_costs_x,
-            lb=[0.0] * num_arcs,
-            ub=[a[4] for a in arcs_data],
-            names=x_names
-        )
+        model.variables.add(obj=obj_costs_x, lb=[0.0] * num_arcs, ub=[a[4] for a in arcs_data], names=x_names)
 
         y_types = [model.variables.type.binary] * num_arcs
-        model.variables.add(
-            obj=obj_costs_y,
-            lb=[0.0] * num_arcs,
-            ub=[1.0] * num_arcs,
-            types=y_types,
-            names=y_names
-        )
+        model.variables.add(obj=obj_costs_y, lb=[0.0] * num_arcs, ub=[1.0] * num_arcs, types=y_types, names=y_names)
 
         # conservação de fluxo
         flow_exprs = []
@@ -221,7 +173,6 @@ def lagrangian_subproblem(num_nodes, arcs_data, b_list,
 
         model.solve()
         status = model.solution.get_status()
-        status_str = model.solution.get_status_string()
 
         if status in (
             model.solution.status.optimal,
@@ -240,6 +191,7 @@ def lagrangian_subproblem(num_nodes, arcs_data, b_list,
             sol = model.solution.get_values()
             x_bar = {x_names[k]: sol[k] for k in range(num_arcs)}
             y_bar = {y_names[k]: sol[num_arcs + k] for k in range(num_arcs)}
+            # print("lrp_obj_value=", lrp_obj_value, " const_mu=", const_mu, " z_lrp_total=", z_lrp_total)
 
             return z_lrp_total, x_bar, y_bar
         else:
@@ -251,61 +203,72 @@ def lagrangian_subproblem(num_nodes, arcs_data, b_list,
         print(f"Erro (Subproblema LRP-CPLEX): {e}")
         return float('inf'), None, None
 
-# PROBLEMA DE SEPARAÇÃO
-# encontra o "Dicot Cut" mais violado.
-# min sum(w_ij * y_bar_ij * u_ij) - sum(b_i * v_i)
-# s.t. u_ij >= v_i - v_j (para u_ij capturar o corte)
-# v_i, u_ij binários
+# PROBLEMA DE SEPARAÇÃO (HEURÍSTICA POR COMPONENTES CONEXOS)
 
-from itertools import combinations
-
-def find_violated_cuts(num_nodes, arcs_data, b_list, y_bar, tol=1e-6, max_cuts=100):
-    # força bruta
+def find_violated_cuts(num_nodes, arcs_data, b_list, y_bar, tol=1e-6):
+    # constroi o grafo G' com base nos arcos abertos em y_bar
+    # lista de adjacência para o grafo não direcionado
+    adj_list = {i: [] for i in range(num_nodes)}
+    
+    for (i, j, c, f, w) in arcs_data:
+        # verifica se o arco (i,j) está aberto em y_bar
+        if y_bar.get(f"y_{i}_{j}", 0.0) > 0.5:
+            adj_list[i].append(j)
+            adj_list[j].append(i) # grafo não direcionado para componentes
 
     violated = []
-    yvals = {(i, j): y_bar.get(f"y_{i}_{j}", 0.0) for (i, j, _, _, _) in arcs_data}
-    nodes = list(range(num_nodes))
-    total_sets = 2 ** num_nodes - 2  # exclui vazio e V
+    visited = set()
 
-    checked = 0
-    for r in range(1, num_nodes):
-        for comb in combinations(nodes, r):
-            checked += 1
-            S = set(comb)
+    # encontra todos os componentes conexos
+    for node in range(num_nodes):
+        if node not in visited:
+            # se novo componente encontrado, inicia a busca 
+            current_component_S = set()
+            queue = [node] # usando BFS
+            
+            while queue:
+                current_node = queue.pop(0)
+                if current_node not in visited:
+                    visited.add(current_node)
+                    current_component_S.add(current_node)
+                    
+                    for neighbor in adj_list[current_node]:
+                        if neighbor not in visited:
+                            queue.append(neighbor)
+            
+            # para cada componente S, verifica se ele viola um dicot cut
+            if (not current_component_S) or (len(current_component_S) == num_nodes):
+                continue
 
-            RHS = sum(max(0, b_list[i]) for i in S)
-            LHS = sum(w * yvals[(i, j)] for (i, j, _, _, w) in arcs_data
-                      if (i in S and j not in S))
-            viol = RHS - LHS
+            # calcula RHS: demanda total dentro do componente S
+            RHS_NET_DEMAND = sum(b_list[i] for i in current_component_S)
 
-            if checked > 100:
-                break
+            if RHS_NET_DEMAND <= tol:
+                continue
+
+            # calcula LHS: capacidade de ENTRADA em S em y_bar
+            LHS_INFLOW_CAP = 0.0
+            for (i, j, c, f, w) in arcs_data:
+                if (i not in current_component_S) and (j in current_component_S):
+                    LHS_INFLOW_CAP += w * y_bar.get(f"y_{i}_{j}", 0.0)
+            
+            viol = RHS_NET_DEMAND - LHS_INFLOW_CAP
 
             if viol > tol:
-                violated.append((frozenset(S), RHS, LHS, viol))
-                if len(violated) >= max_cuts:
-                    # print(f"Atingido limite de {max_cuts} cortes.")
-                    violated.sort(key=lambda x: -x[3])
-                    return violated
+                violated.append((frozenset(current_component_S), RHS_NET_DEMAND, LHS_INFLOW_CAP, viol))
+                #print(f"Corte violado: S={set(current_component_S)}, Viol={viol:.2f} (RHS={RHS:.2f}, LHS={LHS:.2f})")
 
-    violated.sort(key=lambda x: -x[3])
-
-    #if violated:
-    #    print(f"{len(violated)} cortes violados encontrados "
-    #          f"(de {total_sets} subconjuntos testados).")
-    #else:
-    #    print(f"Nenhum corte violado encontrado "
-    #          f"(avaliados {total_sets} subconjuntos).")
-
-    return violated
+    # ordena pelos cortes mais violados primeiro
+    violated.sort(key=lambda x: -x[3], reverse=True)
+    
+    # limita o número de cortes para não sobrecarregar o LRP
+    max_cuts_to_add = 50 
+    return violated[:max_cuts_to_add]
 
 # MÉTODO DO SUBGRADIENTE
 
 def subgradient_method_ndrc(num_nodes, num_arcs, b_list, arcs_data, initial_upper_bound, 
-                            max_iter=2000, no_improvement_limit=50):
-
-    import sys
-    import time
+                            max_iter=2000, no_improvement_limit=100):
 
     start_time = time.time() 
 
@@ -328,6 +291,7 @@ def subgradient_method_ndrc(num_nodes, num_arcs, b_list, arcs_data, initial_uppe
     existing_cuts_S = set()
 
     for k in range(max_iter):
+        existing_demand_sets_this_iter = set()
         active_cuts_for_lrp = []
         for cut_id, mu_k in mu_multipliers.items():
             if mu_k > 1e-9:
@@ -341,6 +305,9 @@ def subgradient_method_ndrc(num_nodes, num_arcs, b_list, arcs_data, initial_uppe
             active_cuts_for_lrp
         )
 
+        active_arcs_count = sum(1 for val in y_bar.values() if val > 0.5)
+        #print(f"Iter {k} o subproblema abriu {active_arcs_count} arcos.")
+
         if x_bar is None:
             print("Parando: LRP inviável.")
             break
@@ -353,12 +320,22 @@ def subgradient_method_ndrc(num_nodes, num_arcs, b_list, arcs_data, initial_uppe
             iter_without_lb_improvement += 1
 
         # heurística lagrangeana
-        if k % 10 == 0:
-            new_ub = lagrangean_heuristic(num_nodes, b_list, arcs_data, y_bar)
+        if k % 5 == 0:
+            # diferentes pesos para as penalidades
+            factors_to_test = [1.2, 2.5, 5.0] 
+            
+            # a escolha do peso depende do k (iter)
+            factor = factors_to_test[(k // 5) % len(factors_to_test)]
+            
+            new_ub = lagrangean_heuristic(num_nodes, b_list, arcs_data, y_bar, penalty_factor=factor)
+            
             if new_ub < best_primal_ub:
-                print(f"Novo Limite Superior (UB) na iteração {k+1}: {new_ub:.2f} (era {best_primal_ub:.2f}).")
+                gap_now = ((new_ub - best_lagrangian_lb) / new_ub) * 100
+                print(f"UB caiu para {new_ub:.2f} (Fator: {factor}) | Gap: {gap_now:.2f}%")
                 best_primal_ub = new_ub
-                pi = max(pi, 1.0)
+                
+                # se achar uma solução melhor, dá um boost no pi para explorar a região
+                pi = max(pi, 1.5) 
                 iter_without_lb_improvement = 0
 
         # subgradiente g_lambda: x - w*y
@@ -368,22 +345,44 @@ def subgradient_method_ndrc(num_nodes, num_arcs, b_list, arcs_data, initial_uppe
 
         # separação de cortes
         violated_cuts = find_violated_cuts(num_nodes, arcs_data, b_list, y_bar)
-        new_cuts = []
+        # zera o rastreador de demanda desta iteração
+        existing_demand_sets_this_iter = set()
+        
+        # itera sobre os cortes encontrados
         for (cut_S, RHS, LHS, viol) in violated_cuts:
-            if cut_S not in existing_cuts_S and frozenset(set(range(num_nodes)) - set(cut_S)) not in existing_cuts_S:
-                new_cuts.append((cut_S, RHS))
-                existing_cuts_S.add(cut_S)
-                cut_pool[cut_counter] = (cut_S, RHS)
-                mu_multipliers[cut_counter] = 0.0
-                #print(f"Adicionado corte id={cut_counter} | viol={viol:.3f} | S={set(cut_S)}")
-                cut_counter += 1
+            
+            # verifica se o corte tem demanda e pula se não tiver
+            cut_demand_set = frozenset(i for i in cut_S if b_list[i] > 0)
+            if not cut_demand_set:
+                continue
+
+            # verifica se a demanda já foi adicionada nessa iteração e pula se sim
+            if cut_demand_set in existing_demand_sets_this_iter:
+                continue
+
+            # verifica se já adicionou o corte S ou seu complemento no processo total
+            # impede duplicatas no pool
+            complement_S = frozenset(set(range(num_nodes)) - set(cut_S))
+            if cut_S in existing_cuts_S or complement_S in existing_cuts_S:
+                continue
+
+            # se passou por todos os filtros, o corte é novo e válido
+            
+            # adiciona ao rastreador global de S
+            existing_cuts_S.add(cut_S) 
+            # adiciona ao rastreador desta iteração
+            existing_demand_sets_this_iter.add(cut_demand_set)
+            # adiciona ao pool de cortes para o LRP
+            cut_pool[cut_counter] = (cut_S, RHS)
+            mu_multipliers[cut_counter] = 0.0
+            cut_counter += 1
 
         # subgradiente g_mu
         g_mu = {}
         for cut_id, (cut_S, cut_RHS) in cut_pool.items():
             cut_LHS_val = sum(w * y_bar.get(f"y_{i}_{j}", 0.0)
                               for (i, j, c, f, w) in arcs_data
-                              if (i in cut_S) and (j not in cut_S))
+                              if (i not in cut_S) and (j in cut_S))
             g_mu[cut_id] = cut_RHS - cut_LHS_val
 
         # modificação de g_mu
@@ -409,7 +408,13 @@ def subgradient_method_ndrc(num_nodes, num_arcs, b_list, arcs_data, initial_uppe
             print(f"Gap (UB - Z(lambda)) muito pequeno na iteração {k+1}. Parando.")
             break
 
-        T = pi * (best_primal_ub - z_lrp_total) / norm_g_total_sq
+        numerator = (best_primal_ub - z_lrp_total)
+        if numerator <= 1e-12:
+            # sem passo (ou passo muito pequeno) evita passo negativo
+            T = 0.0
+        else:
+            T = pi * numerator / norm_g_total_sq
+
 
         # atualização dos multiplicadores
         lambda_multipliers = np.maximum(0.0, lambda_multipliers + T * g_lambda)
@@ -440,12 +445,19 @@ def subgradient_method_ndrc(num_nodes, num_arcs, b_list, arcs_data, initial_uppe
     elapsed_time = time.time() - start_time
 
     print(f"\nMétodo NDRC concluído em {total_iter} iterações.")
+    if cut_pool:
+        total_cuts_in_pool = len(cut_pool)
+        active_cuts_count = sum(1 for mu_k in mu_multipliers.values() if mu_k > 1e-9)
+        print(f"Total de cortes encontrados.............: {total_cuts_in_pool}")
+        print(f"Total de cortes ativos no final (mu > 0): {active_cuts_count}")
+    else:
+        print("Nenhum corte de conectividade foi adicionado ao pool.")
     print(f"Tempo total de execução: {elapsed_time:.4f} segundos.")
     sys.stdout.flush()
 
     return best_primal_ub, best_lagrangian_lb
 
-# SOLVER PRINCIPAL
+# SOLVER
 
 def solver(file):
     start_total_time = time.time()
@@ -457,7 +469,7 @@ def solver(file):
         
     print(f"Instância carregada: {num_nodes} nós, {num_arcs} arcos.\n")
    
-    print("   > HEURÍSTICA INICIAL (UB) <")
+    print("INICIALIZANDO... ")
     initial_ub = initial_heuristic(num_nodes, b_list, arcs_data)
     print(f"Valor da solução heurística (UB Inicial): {initial_ub:.2f}\n")
 
@@ -465,27 +477,24 @@ def solver(file):
         print("Heurística inicial infactível. Parando.")
         return
 
-    print("   > MÉTODO DO SUBGRADIENTE (NDRC) <")
-
     final_ub, final_lb = subgradient_method_ndrc(
         num_nodes, num_arcs, b_list, arcs_data, 
         initial_upper_bound=initial_ub
     )
     
-    print("\n   > RELATÓRIO FINAL DE EXECUÇÃO <")
-    print(f"Limite Inferior (Lagrangeano NDRC).: {final_lb:.2f}")
-    print(f"Limite Superior Final (Primal).....: {final_ub:.2f}")
+    print(f"Limite Inferior (Lagrangeano NDRC)......: {final_lb:.2f}")
+    print(f"Limite Superior Final (Primal)..........: {final_ub:.2f}")
 
     gap = 0.0
     if final_ub != float('inf') and abs(final_ub) > 1e-6:
         gap = ((final_ub - final_lb) / final_ub) * 100
     
-    print(f"Gap de Otimização Final............: {gap:.2f}%\n")
+    print(f"Gap de Otimização Final.................: {gap:.4f}%")
     total_time = time.time() - start_total_time
-    print(f"Tempo Total de Execução do Solver..: {total_time:.4f} segundos")
+    print(f"Tempo Total de Execução do Solver.......: {total_time:.4f} segundos")
 
 
 # EXECUÇÃO
 
-file = 'instancia_frcf_1.txt'
+file = 'instances\instancia_frcf_5.txt'
 solver(file)
