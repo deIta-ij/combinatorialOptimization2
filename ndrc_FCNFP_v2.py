@@ -1,61 +1,13 @@
+import sys
 import cplex
 import numpy as np
 import time
-import sys
+from reader import read_instance
 from itertools import chain, combinations
-
-# LEITOR DE INSTÂNCIAS
-
-def read_instance(filename):
-    params = {}
-    node_balances = {}
-    arcs_data = []
-
-    try:
-        with open(filename, 'r') as f:
-            section = None
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith('#'):
-                    continue
-
-                if line == "NODE_BALANCES":
-                    section = "nodes"
-                    continue
-                elif line == "ARCS":
-                    section = "arcs"
-                    continue
-                elif line == "END_NODE_BALANCES" or line == "END_ARCS":
-                    section = None
-                    continue
-
-                if section == "nodes":
-                    parts = line.split()
-                    node_id = int(parts[0])
-                    b_i = int(parts[1])
-                    node_balances[node_id] = b_i
-                elif section == "arcs":
-                    parts = line.split()
-                    i = int(parts[0])
-                    j = int(parts[1])
-                    c_ij = int(parts[2])
-                    f_ij = int(parts[3])
-                    w_ij = int(parts[4])
-                    arcs_data.append((i, j, c_ij, f_ij, w_ij))
-                elif section is None and ':' in line:
-                    key, value = line.split(':', 1)
-                    params[key.strip()] = int(value.strip())
-
-    except FileNotFoundError:
-        print(f"Erro: File '{filename}' not found.")
-        sys.exit(1)
-        
-    return params, node_balances, arcs_data
 
 # HEURÍSTICA PRIMAL
 
-def initial_heuristic(num_nodes, b_list, arcs_data):
-    print("  Calculando UB inicial (Heurística MCF).")
+def initial_heuristic(num_nodes, b_list, arcs_data): # MFC
     try:
         model = cplex.Cplex()
         model.set_log_stream(None)
@@ -63,7 +15,7 @@ def initial_heuristic(num_nodes, b_list, arcs_data):
         model.objective.set_sense(model.objective.sense.minimize)
 
         x_names = [f"x_{i}_{j}" for (i, j, c, f, w) in arcs_data]
-        x_costs = [c for (i, j, c, f, w) in arcs_data]
+        x_costs = [c + (f / w) if w > 0 else c for (i, j, c, f, w) in arcs_data]
         x_caps = [w for (i, j, c, f, w) in arcs_data]
         model.variables.add(obj=x_costs, ub=x_caps, names=x_names)
 
@@ -83,13 +35,15 @@ def initial_heuristic(num_nodes, b_list, arcs_data):
         model.solve()
 
         if model.solution.get_status() == model.solution.status.optimal:
-            solution_x = model.solution.get_values()
-            variable_cost = model.solution.get_objective_value()
-            fixed_cost = 0.0
+            sol_x = model.solution.get_values()
+            total_cost = 0.0
             for k, (i, j, c, f, w) in enumerate(arcs_data):
-                if solution_x[k] > 1e-6:
-                    fixed_cost += f
-            return variable_cost + fixed_cost
+                flow_val = sol_x[k]
+                total_cost += flow_val * c
+                if flow_val > 1e-6:
+                    total_cost += f
+            
+            return total_cost
         else:
             return float('inf')
     except cplex.exceptions.CplexError as e:
@@ -97,58 +51,64 @@ def initial_heuristic(num_nodes, b_list, arcs_data):
     
 # HEURÍSTICA LAGRANGEANA
         
-def lagrangean_heuristic(num_nodes, b_list, arcs_data, y_bar):
-    open_arcs = []
-    open_arcs_names = []
-    
-    for (i, j, c, f, w) in arcs_data:
-         if y_bar.get(f"y_{i}_{j}", 0) > 0.5:
-            open_arcs.append((i, j, c, f, w))
-            open_arcs_names.append(f"x_{i}_{j}")
-    
-    if not open_arcs:
-        if all(b == 0 for b in b_list): return 0.0
-        return float('inf')
-
+def lagrangean_heuristic(num_nodes, b_list, arcs_data, y_bar, penalty_factor=1.0): # Slope Scaling
     try:
         model = cplex.Cplex()
         model.set_log_stream(None)
         model.set_results_stream(None)
         model.objective.set_sense(model.objective.sense.minimize)
 
-        x_costs = [c for (i, j, c, f, w) in open_arcs]
-        x_caps = [w for (i, j, c, f, w) in open_arcs]
-        model.variables.add(obj=x_costs, ub=x_caps, names=open_arcs_names)
+        x_names = [f"x_{i}_{j}" for (i, j, c, f, w) in arcs_data]
+        x_caps = [w for (i, j, c, f, w) in arcs_data]
 
+        guided_costs = []
+        for (i, j, c, f, w) in arcs_data:
+            val_y = y_bar.get(f"y_{i}_{j}", 0.0)
+            
+            if val_y > 0.5:
+                guided_costs.append(c)
+            else:
+                # penalidade multiplicada pelo fator penalty_factor
+                base_penalty = c + (f / w) if w > 1e-6 else c
+                guided_costs.append(base_penalty * penalty_factor)
+
+        model.variables.add(obj=guided_costs, ub=x_caps, names=x_names)
+
+        # restrições de fluxo
         constraints = []
         for node_id in range(num_nodes):
             flow_balance = cplex.SparsePair()
-            for k, (i, j, c, f, w) in enumerate(open_arcs):
+            for k, (i, j, c, f, w) in enumerate(arcs_data):
                 if i == node_id:
-                    flow_balance.ind.append(open_arcs_names[k])
-                    flow_balance.val.append(1.0)
+                    flow_balance.ind.append(x_names[k]); flow_balance.val.append(1.0)
                 if j == node_id:
-                    flow_balance.ind.append(open_arcs_names[k])
-                    flow_balance.val.append(-1.0)
+                    flow_balance.ind.append(x_names[k]); flow_balance.val.append(-1.0)
             constraints.append(flow_balance)
         model.linear_constraints.add(lin_expr=constraints, senses=['E'] * num_nodes, rhs=b_list)
 
         model.solve()
 
         if model.solution.get_status() == model.solution.status.optimal:
-            variable_cost = model.solution.get_objective_value()
-            fixed_cost = sum(f for (i, j, c, f, w) in open_arcs)
-            return variable_cost + fixed_cost
+            sol_x = model.solution.get_values()
+            
+            # calcula os custos reais
+            real_total_cost = 0.0
+            for k, (i, j, c, f, w) in enumerate(arcs_data):
+                flow_val = sol_x[k]
+                real_total_cost += flow_val * c
+                if flow_val > 1e-6:
+                    real_total_cost += f
+            return real_total_cost
         else:
             return float('inf')
-    except cplex.exceptions.CplexError as e:
+
+    except cplex.exceptions.CplexError:
         return float('inf')
 
 # SUBPROBLEMA LAGRANGEANO
 
 def lagrangian_subproblem(num_nodes, arcs_data, b_list, 
                                 lambda_multipliers, active_cuts_pool):
-
     try:
         model = cplex.Cplex()
         model.set_log_stream(None)
@@ -168,8 +128,8 @@ def lagrangian_subproblem(num_nodes, arcs_data, b_list,
 
         for k, (i, j, c, f, w) in enumerate(arcs_data):
             lam = lambda_multipliers[k]
-            obj_costs_x.append(c + lam)            # custo c_ij + lambda_ij para x_ij
-            obj_costs_y.append(f - lam * w)        # custo f_ij - lambda_ij * w_ij para y_ij
+            obj_costs_x.append(c + lam) # custo c_ij + lambda_ij para x_ij
+            obj_costs_y.append(f - lam * w) # custo f_ij - lambda_ij * w_ij para y_ij
 
         # ajuste dos custos com mu_k (cortes de conectividade)
         const_mu = 0.0
@@ -182,21 +142,10 @@ def lagrangian_subproblem(num_nodes, arcs_data, b_list,
                         obj_costs_y[k] -= mu_k * w
 
         # variáveis
-        model.variables.add(
-            obj=obj_costs_x,
-            lb=[0.0] * num_arcs,
-            ub=[a[4] for a in arcs_data],
-            names=x_names
-        )
+        model.variables.add(obj=obj_costs_x, lb=[0.0] * num_arcs, ub=[a[4] for a in arcs_data], names=x_names)
 
         y_types = [model.variables.type.binary] * num_arcs
-        model.variables.add(
-            obj=obj_costs_y,
-            lb=[0.0] * num_arcs,
-            ub=[1.0] * num_arcs,
-            types=y_types,
-            names=y_names
-        )
+        model.variables.add(obj=obj_costs_y, lb=[0.0] * num_arcs, ub=[1.0] * num_arcs, types=y_types, names=y_names)
 
         # conservação de fluxo
         flow_exprs = []
@@ -273,7 +222,7 @@ def find_violated_cuts(num_nodes, arcs_data, b_list, y_bar, tol=1e-6):
     # encontra todos os componentes conexos
     for node in range(num_nodes):
         if node not in visited:
-            # se novo componente encontrad, inicia a busca 
+            # se novo componente encontrado, inicia a busca 
             current_component_S = set()
             queue = [node] # usando BFS
             
@@ -319,7 +268,7 @@ def find_violated_cuts(num_nodes, arcs_data, b_list, y_bar, tol=1e-6):
 # MÉTODO DO SUBGRADIENTE
 
 def subgradient_method_ndrc(num_nodes, num_arcs, b_list, arcs_data, initial_upper_bound, 
-                            max_iter=2000, no_improvement_limit=50):
+                            max_iter=2000, no_improvement_limit=100):
 
     start_time = time.time() 
 
@@ -356,6 +305,9 @@ def subgradient_method_ndrc(num_nodes, num_arcs, b_list, arcs_data, initial_uppe
             active_cuts_for_lrp
         )
 
+        active_arcs_count = sum(1 for val in y_bar.values() if val > 0.5)
+        #print(f"Iter {k} o subproblema abriu {active_arcs_count} arcos.")
+
         if x_bar is None:
             print("Parando: LRP inviável.")
             break
@@ -368,12 +320,22 @@ def subgradient_method_ndrc(num_nodes, num_arcs, b_list, arcs_data, initial_uppe
             iter_without_lb_improvement += 1
 
         # heurística lagrangeana
-        if k % 10 == 0:
-            new_ub = lagrangean_heuristic(num_nodes, b_list, arcs_data, y_bar)
+        if k % 5 == 0:
+            # diferentes pesos para as penalidades
+            factors_to_test = [1.2, 2.5, 5.0] 
+            
+            # a escolha do peso depende do k (iter)
+            factor = factors_to_test[(k // 5) % len(factors_to_test)]
+            
+            new_ub = lagrangean_heuristic(num_nodes, b_list, arcs_data, y_bar, penalty_factor=factor)
+            
             if new_ub < best_primal_ub:
-                print(f"Novo Limite Superior (UB) na iteração {k+1}: {new_ub:.2f} (era {best_primal_ub:.2f}).")
+                gap_now = ((new_ub - best_lagrangian_lb) / new_ub) * 100
+                print(f"UB caiu para {new_ub:.2f} (Fator: {factor}) | Gap: {gap_now:.2f}%")
                 best_primal_ub = new_ub
-                pi = max(pi, 1.0)
+                
+                # se achar uma solução melhor, dá um boost no pi para explorar a região
+                pi = max(pi, 1.5) 
                 iter_without_lb_improvement = 0
 
         # subgradiente g_lambda: x - w*y
@@ -495,7 +457,7 @@ def subgradient_method_ndrc(num_nodes, num_arcs, b_list, arcs_data, initial_uppe
 
     return best_primal_ub, best_lagrangian_lb
 
-# SOLVER PRINCIPAL
+# SOLVER
 
 def solver(file):
     start_total_time = time.time()
@@ -507,7 +469,7 @@ def solver(file):
         
     print(f"Instância carregada: {num_nodes} nós, {num_arcs} arcos.\n")
    
-    print("   > HEURÍSTICA INICIAL (UB) <")
+    print("INICIALIZANDO... ")
     initial_ub = initial_heuristic(num_nodes, b_list, arcs_data)
     print(f"Valor da solução heurística (UB Inicial): {initial_ub:.2f}\n")
 
@@ -515,27 +477,24 @@ def solver(file):
         print("Heurística inicial infactível. Parando.")
         return
 
-    print("   > MÉTODO DO SUBGRADIENTE (NDRC) <")
-
     final_ub, final_lb = subgradient_method_ndrc(
         num_nodes, num_arcs, b_list, arcs_data, 
         initial_upper_bound=initial_ub
     )
     
-    print("\n   > RELATÓRIO FINAL DE EXECUÇÃO <")
-    print(f"Limite Inferior (Lagrangeano NDRC).: {final_lb:.2f}")
-    print(f"Limite Superior Final (Primal).....: {final_ub:.2f}")
+    print(f"Limite Inferior (Lagrangeano NDRC)......: {final_lb:.2f}")
+    print(f"Limite Superior Final (Primal)..........: {final_ub:.2f}")
 
     gap = 0.0
     if final_ub != float('inf') and abs(final_ub) > 1e-6:
         gap = ((final_ub - final_lb) / final_ub) * 100
     
-    print(f"Gap de Otimização Final............: {gap:.4f}%\n")
+    print(f"Gap de Otimização Final.................: {gap:.4f}%")
     total_time = time.time() - start_total_time
-    print(f"Tempo Total de Execução do Solver..: {total_time:.4f} segundos")
+    print(f"Tempo Total de Execução do Solver.......: {total_time:.4f} segundos")
 
 
 # EXECUÇÃO
 
-file = 'instancia_frcf_1.txt'
+file = 'instances\instancia_frcf_5.txt'
 solver(file)
