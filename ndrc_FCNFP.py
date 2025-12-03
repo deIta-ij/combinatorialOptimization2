@@ -265,7 +265,7 @@ def find_violated_cuts(num_nodes, arcs_data, b_list, y_bar, tol=1e-6):
     max_cuts_to_add = 50 
     return violated[:max_cuts_to_add]
 
-# MÉTODO DO SUBGRADIENTE
+# LOOP PRINCIPAL
 
 def subgradient_method_ndrc(num_nodes, num_arcs, b_list, arcs_data, initial_upper_bound, 
                             max_iter=2000, no_improvement_limit=100):

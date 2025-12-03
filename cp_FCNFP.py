@@ -85,7 +85,7 @@ def solve_cp_v2(params, b, arcs_data):
     y = {a: mdl.binary_var(name=f'y_{a[0]}_{a[1]}') for a in arcs}
     
     # x_ij: variável INTEIRA de fluxo
-    x = {a: mdl.integer_var(name=f'x_{a[0]}_{a[1]}') for a in arcs}
+    x = {a: mdl.integer_var(min=0, max=w[a], name=f'x_{a[0]}_{a[1]}') for a in arcs}
 
     # restrições de balanço
     for i in nodes:
@@ -125,7 +125,7 @@ def solve_cp_v2(params, b, arcs_data):
 
 # EXECUÇÃO
 
-instance_file = "instances\instancia_frcf_1.txt" 
+instance_file = "instances\\instancia_frcf_1.txt" 
 params, balances, arc_data = read_instance(instance_file)
 print(f"Instância carregada: {params['NUM_NODES']} nós, {params['NUM_ARCS']} arcos.")
 solve_cp_v1(params, balances, arc_data)
