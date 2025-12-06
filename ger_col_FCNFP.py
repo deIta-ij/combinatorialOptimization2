@@ -158,31 +158,24 @@ class FCNFP_CPLEX:
 
 # EXECUÇÃO
 
-instance_file = "ndrc\instancia_frcf_2.txt"
+instance_file = "instances/instancia_frcf_5.txt"
+params, raw_balances, raw_arcs = read_instance(instance_file)
+
+nodes = list(raw_balances.keys())
+for i, j, _, _, _ in raw_arcs:
+    if i not in nodes: nodes.append(i)
+    if j not in nodes: nodes.append(j)
     
-if not os.path.exists(instance_file):
-    print(f"Arquivo '{instance_file}' não encontrado.")
-else:
-    print(f"Lendo instância: {instance_file}.")
-    params, raw_balances, raw_arcs = read_instance(instance_file)
-    
-    nodes = list(raw_balances.keys())
-    for i, j, _, _, _ in raw_arcs:
-        if i not in nodes: nodes.append(i)
-        if j not in nodes: nodes.append(j)
-        
-    supplies = raw_balances
-    
-    arcs = []
-    costs = {}
-    fixed_costs = {}
-    capacities = {}
-    
-    for (i, j, c, f, w) in raw_arcs:
-        arcs.append((i, j))
-        costs[(i, j)] = c
-        fixed_costs[(i, j)] = f
-        capacities[(i, j)] = w
-        
-    cp = FCNFP_CPLEX(nodes, arcs, supplies, costs, fixed_costs, capacities)
-    cp.run()
+supplies = raw_balances
+arcs = []
+costs = {}
+fixed_costs = {}
+capacities = {}
+
+for (i, j, c, f, w) in raw_arcs:
+    arcs.append((i, j))
+    costs[(i, j)] = c
+    fixed_costs[(i, j)] = f
+    capacities[(i, j)] = w
+cp = FCNFP_CPLEX(nodes, arcs, supplies, costs, fixed_costs, capacities)
+cp.run()

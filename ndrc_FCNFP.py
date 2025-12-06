@@ -496,5 +496,5 @@ def solver(file):
 
 # EXECUÇÃO
 
-file = 'instances\instancia_frcf_5.txt'
+file = 'instances/instancia_frcf_4.txt'
 solver(file)

@@ -2,6 +2,8 @@ import sys
 from docplex.mp.model import Model
 from collections import defaultdict
 
+# benders automático
+
 # leitura de instância
 def read_instance(filename):
     params = {}
@@ -91,6 +93,24 @@ def main(params, NODE_BALANCES, ARC_DATA):
     # evita que ele tente fazer outra decomposição
     # usa as annotations
     mdl.parameters.benders.strategy.set(3)
+
+    mdl.parameters.timelimit = 1200
+
+    # tentando desativar todos os outros cortes
+    mdl.parameters.mip.cuts.cliques = -1
+    mdl.parameters.mip.cuts.covers = -1
+    mdl.parameters.mip.cuts.flowcovers = -1
+    mdl.parameters.mip.cuts.gubcovers = -1
+    mdl.parameters.mip.cuts.implied = -1
+    mdl.parameters.mip.cuts.liftproj = -1
+    mdl.parameters.mip.cuts.localimplied = -1
+    mdl.parameters.mip.cuts.mcfcut = -1
+    mdl.parameters.mip.cuts.mircut = -1
+    mdl.parameters.mip.cuts.pathcut = -1
+    mdl.parameters.mip.cuts.zerohalfcut = -1 
+    mdl.parameters.mip.cuts.gomory = -1
+    mdl.parameters.mip.strategy.heuristicfreq = -1
+    
     print(f"Modelo configurado com {NUM_NODES} nós e {len(all_arcs)} arcos.")
     print("Estratégia Benders: Workers.")
 
@@ -98,27 +118,22 @@ def main(params, NODE_BALANCES, ARC_DATA):
 
     # resultados
     if solution:
-        print("\n   SOLUÇÃO ÓTIMA ENCONTRADA")
-        print(f"Tempo de Solução (segundos): {mdl.get_solve_details().time:.4f}")
-        print(f"Custo Total: {solution.get_objective_value():.2f}")
+        print("\nRESULTADOS")
+        print(f"Tempo de Solução (segundos):.............. {mdl.get_solve_details().time:.4f}")
+        print(f"Custo Total:.............................. {solution.get_objective_value():.2f}")
         
-        print("\nDetalhes dos Arcos Utilizados (y=1):")
-        for arc in all_arcs:
-            flow_val = solution.get_value(x[arc])
-            design_val = solution.get_value(y[arc])
-            
-            if design_val > 0.5:
-                print(f"  Arco {arc[0]}->{arc[1]} | Custo Fixo: {F[arc]} | Fluxo: {flow_val:.2f} / {W[arc]}")
+        #print("\nDetalhes dos Arcos Utilizados (y=1):")
+        #for arc in all_arcs:
+        #    flow_val = solution.get_value(x[arc])
+        #    design_val = solution.get_value(y[arc])
+        #    
+        #    if design_val > 0.5:
+        #        print(f"  Arco {arc[0]}->{arc[1]} | Custo Fixo: {F[arc]} | Fluxo: {flow_val:.2f} / {W[arc]}")
     else:
         print("\nO CPLEX não encontrou solução ótima.")
 
 # executar
-instance_file = "ndrc/instancia_frcf_1.txt"
+instance_file = "instances/instancia_frcf_5.txt"
 print(f"Lendo a instância: {instance_file}")
 params, NODE_BALANCES, ARC_DATA = read_instance(instance_file)
-
-if not ARC_DATA:
-    print("Erro na leitura dos dados.")
-    sys.exit(1)
-
 main(params, NODE_BALANCES, ARC_DATA)
