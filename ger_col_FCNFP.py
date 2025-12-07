@@ -2,7 +2,7 @@ import os
 from reader import read_instance
 from docplex.mp.model import Model
 
-class FCNFP_CPLEX:
+class FCNFP_GC:
     def __init__(self, nodes, arcs, supplies, costs, fixed_costs, capacities): # inicializador
         self.nodes = nodes
         self.arcs = arcs
@@ -12,13 +12,13 @@ class FCNFP_CPLEX:
         self.capacities = capacities
         
         self.generated_columns = []
-        self.duals_capacity = {} # pi_ij
+        self.duals_capacity = {} # pi
         self.dual_convexity = 0.0 # alpha
 
     # subproblema: fluxo de custo mínimo
     def solve_subproblem(self):
-        # custo "ajustado"
-        # (c - muA) - coeficiente do x* no cálculo do custo reduzido
+        # custo ajustado
+        # (c - pi) - coeficiente do x no cálculo do custo reduzido
         adjusted_costs = {}
         for (i, j) in self.arcs:
             pi = self.duals_capacity.get((i, j), 0.0)
@@ -103,31 +103,37 @@ class FCNFP_CPLEX:
         for (i, j) in self.arcs:
             self.duals_capacity[(i, j)] = capacity[(i, j)].dual_value
             
-        return sol.objective_value
+        # pega a solução primal
+        y_vals = {a: sol.get_value(y[a]) for a in self.arcs if sol.get_value(y[a]) > 1e-5}
+        lambda_vals = {k: sol.get_value(lambdas[k]) for k in K if sol.get_value(lambdas[k]) > 1e-5}
+            
+        return sol.objective_value, y_vals, lambda_vals
 
-    def run(self, max_iter=2000, tolerance=1e-5):
-        print(f"    GERAÇÃO DE COLUNAS")
+    def run(self, tolerance=1e-5):
+        print(f"GERAÇÃO DE COLUNAS")
         
         self.duals_capacity = {(i,j): 0.0 for (i,j) in self.arcs}
         self.dual_convexity = 0.0
         
-        # geração de coluna inicial
-        init_pattern, _ = self.solve_subproblem()
+        init_pattern, _ = self.solve_subproblem() # primeira coluna
         if init_pattern is None:
-            # isso não deve ocorrer já que as instâncias 
-            # têm redes q suportam a demanda e não são desconexas
             print("Erro: Subproblema inviável na inicialização.")
             return
         self.generated_columns.append(init_pattern)
         print(f"Coluna inicial gerada.")
         
-        final_obj = 0
-        for iter in range(1, max_iter + 1):
-            # chama o mestre
-            obj_val = self.solve_master()
+        final_obj = 0.0
+        final_y = {}
+        final_lambdas = {}
+        iter_count = 0
+
+        while True:
+            iter_count += 1
+            
+            # resolve o mestre e pega a solução
+            obj_val, y_sol, lambda_sol = self.solve_master()
+            
             if obj_val is None: 
-                # aqui seria o caso de adicionar variáveis
-                # "artificiais"
                 break
             
             # chama o subproblema
@@ -136,23 +142,59 @@ class FCNFP_CPLEX:
                 print("Erro no subproblema.")
                 break
 
-            active_flows = [f"{k}: {v:.1f}" for k, v in new_column.items() if v > 1e-5]
-            print(f"Coluna gerada: {active_flows}")
-            print(f"Iter {iter}: Obj Mestre = {obj_val:.4f}, Custo Reduzido = {reduced_cost:.6f}")
+            print(f"Iter: {iter_count}, Obj Mestre = {obj_val:.4f}, Custo Reduzido = {reduced_cost:.6f}")
             
+            # filtra os fluxos positivos para visualizar a coluna gerada
+            fluxos_ativos = {arc: flow for arc, flow in new_column.items() if flow > 1e-5}
+            print(f"Coluna gerada: {fluxos_ativos}")
+
+            # parada em caso de custo reduzido positivo
             if reduced_cost >= -tolerance:
-                print("Algoritmo convergiu.")
+                print(f"PARADA: solução ótima.")
                 final_obj = obj_val
+                final_y = y_sol
+                final_lambdas = lambda_sol
                 break
             
+            # parada em caso de ciclagem
+            if new_column in self.generated_columns:
+                print("PARADA: nenhuma coluna nova gerada.")
+                final_obj = obj_val
+                final_y = y_sol
+                final_lambdas = lambda_sol
+                break
+
             self.generated_columns.append(new_column)
             final_obj = obj_val
+            final_y = y_sol
+            final_lambdas = lambda_sol
         
         if final_obj > 0:
-            print("\n   SOLUÇÃO")
+            print("\nSOLUÇÃO\n")
             print(f"Custo Ótimo: {final_obj:.4f}")
+            print(f"Iterações Totais: {iter_count}\n")
+            
+            #print("Arcos abertos (y):")
+            #if not final_y:
+            #    print("   Nenhum arco aberto (y=0).")
+            #for a, val in final_y.items():
+            #    print(f"Arco {a}: y = {val:.4f}")
+            
+            #print("Fluxo nos Arcos (x_total):")
+            # fluxo total na rede: soma(lambda_k * fluxo_k) (x original)
+            #aggregated_flow = {(i,j): 0.0 for (i,j) in self.arcs}
+            
+            #for k, l_val in final_lambdas.items():
+            #    col = self.generated_columns[k]
+            #    for arc in self.arcs:
+            #        aggregated_flow[arc] += l_val * col[arc]
+            
+            #for arc, flow in aggregated_flow.items():
+            #    if flow > 1e-5:
+            #        print(f"Arco {arc}: fluxo = {flow:.4f}")
+            
         else:
-             print("\nFALHOU.")
+             print("\nMÉTODO FALHOU.")
         
         return final_obj
 
@@ -166,16 +208,17 @@ for i, j, _, _, _ in raw_arcs:
     if i not in nodes: nodes.append(i)
     if j not in nodes: nodes.append(j)
     
-supplies = raw_balances
+supplies = raw_balances 
 arcs = []
 costs = {}
 fixed_costs = {}
 capacities = {}
 
-for (i, j, c, f, w) in raw_arcs:
+for (i, j, c, f, w) in raw_arcs: # transforma em dicionário indexado por arco
     arcs.append((i, j))
     costs[(i, j)] = c
     fixed_costs[(i, j)] = f
     capacities[(i, j)] = w
-cp = FCNFP_CPLEX(nodes, arcs, supplies, costs, fixed_costs, capacities)
+
+cp = FCNFP_GC(nodes, arcs, supplies, costs, fixed_costs, capacities)
 cp.run()
